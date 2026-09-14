@@ -76,10 +76,11 @@ if photos:
         photos = photos[:5]
 
     labs = []
-    st.write("각 사진에서 **파운데이션이 발린 부분만** 네모 박스로 선택해주세요:")
+    st.write("각 사진에서 **파운데이션이 발린 부분만** 네모 박스로 선택해주세요 (색상 카드는 자동으로 인식돼요):")
     for i, photo in enumerate(photos):
         img = Image.open(photo)
         st.write(f"사진 {i+1}/{len(photos)}")
+
         cropped = st_cropper(img, realtime_update=True, box_color="#FF4B4B", aspect_ratio=None, key=f"crop-{i}")
 
         bgr_full = pil_to_bgr(img)
