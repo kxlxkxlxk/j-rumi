@@ -109,6 +109,9 @@ if image_bgr is not None:
             unsafe_allow_html=True,
         )
 
+        if not result.debug.get("brighter_pool_used", True):
+            st.caption("ℹ️ 측정된 피부색보다 밝은 색상이 DB에 없어서, 이번엔 전체 DB 중 가장 가까운 색으로 추천했어요.")
+
         st.write("가까운 순서 Top 3")
         cols = st.columns(3)
         for col, m in zip(cols, result.matches):
@@ -147,6 +150,8 @@ if image_bgr is not None:
                     "최종 채택 영역": result.debug["final_region"],
                     "카드 보정 평균 오차": round(result.debug["calibration_mean_error"], 2),
                     "DB 출처": source,
+                    "밝은 색상만 비교했는지": result.debug["brighter_pool_used"],
+                    "비교 대상 색상 개수": result.debug["n_candidates_considered"],
                     "영역별 샘플": result.debug["regions"],
                 }
             )

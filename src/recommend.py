@@ -17,7 +17,7 @@ from skimage.color import deltaE_ciede2000
 
 from .calibration import calibrate_from_image
 from .skin_extraction import extract_skin_regions
-from .color_match import rgb_to_lab, find_best_matches
+from .color_match import rgb_to_lab, find_best_matches_meta
 
 
 @dataclass
@@ -114,7 +114,7 @@ def recommend_foundation(
         rd["used_as_final"] = i == medoid_idx
         rd["excluded_as_outlier"] = i not in kept_idx
 
-    matches = find_best_matches(final_lab, shades, top_n=top_n)
+    matches, match_meta = find_best_matches_meta(final_lab, shades, top_n=top_n, require_brighter=True)
 
     return RecommendationResult(
         True,
@@ -126,6 +126,8 @@ def recommend_foundation(
             "final_region": skin.regions[medoid_idx].name,
             "calibration_mean_error": calib.mean_delta_e,
             "correction_matrix": calib.correction_matrix.tolist(),
+            "brighter_pool_used": match_meta["brighter_pool_used"],
+            "n_candidates_considered": match_meta["n_candidates"],
         },
     )
 
