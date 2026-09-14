@@ -5,6 +5,7 @@ from PIL import Image
 import streamlit as st
 
 from src.recommend import recommend_foundation
+from src.calibration import apply_correction_image
 from src import github_storage
 
 st.set_page_config(page_title="파운데이션 색상 추천", page_icon="💄")
@@ -118,6 +119,26 @@ if image_bgr is not None:
                     unsafe_allow_html=True,
                 )
                 st.caption(f"{m['brand']} {m['name']}\n\nΔE {m['delta_e']:.1f}")
+
+        with st.expander("🔍 색 보정 전/후 비교", expanded=True):
+            correction_matrix = np.array(result.debug["correction_matrix"])
+            rgb_before = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            rgb_after = apply_correction_image(rgb_before, correction_matrix)
+
+            st.caption("사진 전체에 카드 보정을 그대로 적용해보면 이렇게 달라져요 (카메라/조명 왜곡 제거):")
+            c1, c2 = st.columns(2)
+            c1.image(rgb_before, caption="보정 전 (원본)", use_container_width=True)
+            c2.image(rgb_after, caption="보정 후", use_container_width=True)
+
+            st.caption("피부색 샘플링에 사용된 영역별 색 (보정 전 → 보정 후):")
+            for rd in result.debug["regions"]:
+                rc1, rc2, rc3 = st.columns([1, 1, 2])
+                raw_hex = "#%02x%02x%02x" % tuple(int(max(0, min(255, v))) for v in rd["raw_rgb"])
+                corr_hex = "#%02x%02x%02x" % tuple(int(max(0, min(255, v))) for v in rd["corrected_rgb"])
+                rc1.markdown(f"<div style='width:100%;height:32px;border-radius:4px;background-color:{raw_hex};'></div>", unsafe_allow_html=True)
+                rc2.markdown(f"<div style='width:100%;height:32px;border-radius:4px;background-color:{corr_hex};'></div>", unsafe_allow_html=True)
+                tag = " ⭐최종채택" if rd.get("used_as_final") else (" (제외됨)" if rd.get("excluded_as_outlier") else "")
+                rc3.caption(f"{rd['name']}{tag} — Lab: L={rd['lab'][0]:.1f}, a={rd['lab'][1]:.1f}, b={rd['lab'][2]:.1f}")
 
         with st.expander("자세히 보기 (분석 정보)"):
             st.json(
