@@ -5,9 +5,10 @@ from PIL import Image
 import streamlit as st
 from streamlit_cropper import st_cropper
 
-from src.calibration import calibrate_from_image
+from src.calibration import calibrate_from_image, capture_card_reference
 from src.color_match import rgb_to_lab
 from src import github_storage
+from src import reference_colors
 
 st.set_page_config(page_title="관리자 - 파운데이션 DB", page_icon="🔒")
 
@@ -118,3 +119,60 @@ if photos:
                 st.error(f"저장 실패: {e}")
         if not (brand and name):
             st.caption("⚠️ 브랜드명과 색상명을 입력해야 저장할 수 있어요.")
+
+st.divider()
+
+# ---- optional: custom card reference (fixes "정확하지만 과하게 보정됨") ----
+st.subheader("📇 카드 기준값 재설정 (선택)")
+st.caption(
+    "지금은 컬러체커 클래식의 공식 발표 수치를 정답으로 놓고 보정하고 있어요. "
+    "이게 특정 카드/조명 조합에서 과하게 색이 튀어 보이면, 카드만 깨끗하게 "
+    "(반사·그림자 없이 정면에서 크게) 찍은 사진 한 장을 등록해서, 그 사진에서 "
+    "측정한 실측값을 새 기준으로 바꿀 수 있어요."
+)
+
+try:
+    current_ref, _ref_sha = github_storage.read_card_reference()
+except Exception as e:
+    current_ref = None
+    st.warning(f"현재 기준값 상태를 확인하지 못했어요: {e}")
+
+if current_ref and current_ref.get("patches"):
+    st.success(f"지금은 커스텀 기준값을 쓰고 있어요 ({len(current_ref['patches'])}/24개 패치 등록됨)")
+    if st.button("공식 기준값으로 되돌리기"):
+        try:
+            github_storage.delete_card_reference()
+            reference_colors.clear_reference_cache()
+            st.success("공식 기준값으로 되돌렸어요")
+            st.rerun()
+        except Exception as e:
+            st.error(f"되돌리기 실패: {e}")
+else:
+    st.caption("지금은 공식 기준값을 쓰고 있어요.")
+
+ref_photo = st.file_uploader("카드만 깨끗하게 찍은 사진 (얼굴 없이 카드만)", type=["jpg", "jpeg", "png"], key="ref_photo")
+if ref_photo is not None:
+    ref_bgr = pil_to_bgr(Image.open(ref_photo))
+    ok, msg, patches = capture_card_reference(ref_bgr)
+    if not ok:
+        st.error(msg)
+    else:
+        st.success(msg)
+        swatch_cols = st.columns(6)
+        for i, (pname, rgb) in enumerate(patches.items()):
+            with swatch_cols[i % 6]:
+                hexcolor = "#%02x%02x%02x" % tuple(int(max(0, min(255, v))) for v in rgb)
+                st.markdown(
+                    f"<div style='width:100%;height:28px;border-radius:4px;background-color:{hexcolor};'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(pname)
+
+        if st.button("이 값을 새 기준으로 저장", type="primary"):
+            try:
+                github_storage.write_card_reference(patches)
+                reference_colors.clear_reference_cache()
+                st.success("저장 완료! 이제부터 이 값을 기준으로 보정돼요.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"저장 실패: {e}")

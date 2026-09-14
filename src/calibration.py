@@ -32,7 +32,12 @@ import numpy as np
 import cv2
 from scipy.optimize import linear_sum_assignment
 
-from .reference_colors import REFERENCE_RGB_LIST, REFERENCE_PATCHES, REFERENCE_NAMES
+from .reference_colors import (
+    REFERENCE_RGB_LIST,
+    REFERENCE_PATCHES,
+    REFERENCE_NAMES,
+    get_active_reference_rgb_list,
+)
 
 CANONICAL_W, CANONICAL_H = 1200, 800  # landscape canonical warp size (~3:2 card)
 
@@ -418,9 +423,19 @@ def _sample_patch_color(warped_bgr: np.ndarray, box):
     return median_bgr[::-1]  # -> RGB
 
 
-def match_patches_to_reference(observed_rgb: np.ndarray):
-    """Hungarian-match observed patch colors to the 24 known reference colors."""
-    ref = np.array(REFERENCE_RGB_LIST, dtype=np.float64)
+def match_patches_to_reference(observed_rgb: np.ndarray, reference_rgb_list=None):
+    """Hungarian-match observed patch colors to the 24 known reference
+    colors. reference_rgb_list defaults to the ACTIVE reference (a custom
+    one captured from the admin page's "clean card photo" flow if one has
+    been saved, else the standard official ColorChecker values) -- see
+    reference_colors.get_active_reference_rgb_list(). Passing the default
+    REFERENCE_RGB_LIST explicitly is only for the one place that must
+    always use the official values regardless of any custom reference:
+    capture_card_reference() below, when establishing a NEW custom
+    reference in the first place."""
+    if reference_rgb_list is None:
+        reference_rgb_list = get_active_reference_rgb_list()
+    ref = np.array(reference_rgb_list, dtype=np.float64)
     obs = np.array(observed_rgb, dtype=np.float64)
     n = min(len(ref), len(obs))
     cost = np.zeros((len(obs), len(ref)))
@@ -470,10 +485,11 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
         return CalibrationResult(False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)")
 
     observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
-    row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb)
+    active_reference = get_active_reference_rgb_list()
+    row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb, active_reference)
 
     matched_observed = observed_rgb[row_ind]
-    matched_reference = np.array(REFERENCE_RGB_LIST)[col_ind]
+    matched_reference = np.array(active_reference)[col_ind]
 
     # A patch with a channel pinned at (near) 0 or 255 is clipped/blown out
     # (usually the white patch catching a specular highlight) -- its
@@ -503,6 +519,58 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
         observed_patch_rgb=matched_observed,
         matched_reference_rgb=matched_reference,
     )
+
+
+def capture_card_reference(bgr_img: np.ndarray):
+    """For the admin "카드 기준값 재설정" flow: given ONE clean, well-lit,
+    straight-on photo of just the physical card (no face, no glare), find
+    it and return its 24 patch colors AS OBSERVED -- no correction
+    applied. These raw observed values are meant to be saved as the new
+    correction TARGET (see reference_colors.get_active_reference_patches /
+    github_storage.write_card_reference), replacing the standard official
+    Calibrite/X-Rite numbers with what this specific physical card and
+    camera combination actually reads under good light. A printed card
+    can drift a bit from the published spec (printing batch, aging), so
+    this can be more accurate for THIS card than the official table.
+
+    Patches are identified (which detected square is "orange_yellow" vs
+    "light_skin" etc.) by nearest-match to the STANDARD official
+    reference colors, regardless of any custom reference already active
+    -- that's only for figuring out which patch is which, not for the
+    value that gets stored.
+
+    Requires all 24 patches to be found (stricter than the normal ~20/24
+    tolerance used on real face photos) since the whole point is a clean,
+    reliable baseline. Returns (success, message, patches_dict_or_None)
+    where patches_dict is {name: [R, G, B]}.
+    """
+    candidates = _candidate_quads(bgr_img)
+    if not candidates:
+        return False, "카드를 사진에서 찾지 못했어요 — 카드만 크고 선명하게 나오도록 다시 찍어주세요", None
+
+    best = None
+    for quad in candidates:
+        warped = warp_card(bgr_img, quad)
+        boxes = detect_patches(warped)
+        if len(boxes) < 20:
+            continue
+        observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
+        row_ind, col_ind, cost = match_patches_to_reference(observed_rgb, REFERENCE_RGB_LIST)
+        total_cost = float(cost[row_ind, col_ind].sum())
+        if best is None or total_cost < best[0]:
+            best = (total_cost, row_ind, col_ind, observed_rgb)
+
+    if best is None:
+        return False, "카드 패치를 충분히 찾지 못했어요 — 반사·그림자 없이 카드가 꽉 차게 다시 찍어주세요", None
+
+    _cost, row_ind, col_ind, observed_rgb = best
+    if len(row_ind) < 24:
+        return False, f"24개 중 {len(row_ind)}개 패치만 인식됐어요 — 카드 전체가 잘리지 않게 다시 찍어주세요", None
+
+    patches = {
+        REFERENCE_NAMES[c]: [round(float(x), 1) for x in observed_rgb[r]] for r, c in zip(row_ind, col_ind)
+    }
+    return True, "카드 24개 패치 전부 인식 완료", patches
 
 
 # A candidate whose best achievable color-matching error is above this is
