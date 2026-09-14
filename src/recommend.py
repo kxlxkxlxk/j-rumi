@@ -125,6 +125,7 @@ def recommend_foundation(
             "regions": region_debug,
             "final_region": skin.regions[medoid_idx].name,
             "calibration_mean_error": calib.mean_delta_e,
+            "correction_matrix": calib.correction_matrix.tolist(),
         },
     )
 

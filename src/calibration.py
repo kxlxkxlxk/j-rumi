@@ -447,6 +447,17 @@ def apply_correction(rgb: np.ndarray, M: np.ndarray) -> np.ndarray:
     return np.clip(corrected, 0, 255)
 
 
+def apply_correction_image(rgb_img: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Same affine correction as apply_correction, but vectorized over a
+    whole HxWx3 RGB image at once (for a debug before/after preview) --
+    equivalent to calling apply_correction on every pixel, just fast."""
+    M = np.array(M, dtype=np.float64)
+    img = np.array(rgb_img, dtype=np.float64)
+    # corrected = M[:, :3] @ pixel + M[:, 3], applied to every pixel
+    corrected = img @ M[:, :3].T + M[:, 3]
+    return np.clip(corrected, 0, 255).astype(np.uint8)
+
+
 def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
     """Run the warp -> patch-detect -> color-match -> solve pipeline for
     ONE candidate quad. Returns a CalibrationResult (success may be False
