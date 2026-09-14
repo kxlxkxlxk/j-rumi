@@ -1,0 +1,9 @@
+streamlit>=1.38
+opencv-python-headless>=4.9
+numpy>=1.26
+mediapipe>=0.10.14
+scikit-image>=0.23
+scipy>=1.11
+requests>=2.31
+Pillow>=10.0
+streamlit-cropper>=0.3.0

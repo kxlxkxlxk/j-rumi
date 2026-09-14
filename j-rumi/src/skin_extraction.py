@@ -1,0 +1,157 @@
+"""
+Face landmark based skin-tone sampling.
+
+Multi-region ROI method (aligned with the original team's documented
+pipeline: 하부 볼 / 입 아래 / 턱 ROI 구성 -> ROI별 대표색 추출 -> 이상치 제외 ->
+CIEDE2000 medoid로 최종 피부색 선정):
+
+Instead of one sample point, this samples several skin regions --both
+lower cheeks, just under the mouth, and the chin-- that tend to avoid
+eyebrows/eyelashes/hair and the shadow that often falls under the eyes.
+Within each region, the brightest and darkest pixels (specular highlight
+/ shadow) are dropped before taking the median color, matching the
+report's "클리핑·그림자 픽셀 제거" step.
+
+This module only returns the raw (uncorrected) color per region. The
+camera-color correction (from calibration.py) and the final CIEDE2000
+medoid selection across regions happen in recommend.py, since that is
+where the corrected Lab values are available.
+
+Landmark indices (mediapipe FaceMesh, refine_landmarks=True, 468+iris):
+  50, 280   - a point on each cheek, below the eye and above the mouth
+              corner (commonly used "cheek" landmarks in AR/makeup apps)
+  175       - just below the lower lip, above the chin (under-mouth)
+  152       - chin tip
+  468, 473  - left/right iris centers (refine_landmarks) -- used only to
+              scale the ROI radius to the person's actual face size via
+              interpupillary distance.
+
+NOTE: these are the commonly-documented mediapipe FaceMesh indices for
+these areas; worth a quick visual sanity check (see debug overlay) against
+a real selfie once available, same caveat as before.
+"""
+
+from dataclasses import dataclass, field
+import numpy as np
+import cv2
+import mediapipe as mp
+
+LEFT_IRIS_CENTER_IDX = 468
+RIGHT_IRIS_CENTER_IDX = 473
+
+# name -> mediapipe landmark index
+REGION_LANDMARKS = {
+    "cheek_a": 50,   # cheek, camera-frame side A
+    "cheek_b": 280,  # cheek, camera-frame side B
+    "under_mouth": 175,
+    "chin": 152,
+}
+
+_face_mesh = None
+
+
+def _get_face_mesh():
+    global _face_mesh
+    if _face_mesh is None:
+        _face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,  # needed for iris landmarks 468-477
+            min_detection_confidence=0.5,
+        )
+    return _face_mesh
+
+
+@dataclass
+class SkinRegionSample:
+    name: str
+    raw_rgb: np.ndarray
+    center: tuple
+    radius: int
+    n_pixels_used: int
+
+
+@dataclass
+class SkinSampleResult:
+    success: bool
+    message: str = ""
+    regions: list = field(default_factory=list)  # list[SkinRegionSample]
+    interpupillary_dist: float = None
+
+
+def _landmark_px(landmarks, idx, w, h):
+    lm = landmarks[idx]
+    return np.array([lm.x * w, lm.y * h])
+
+
+def _sample_region(rgb_img: np.ndarray, center, radius: int, clip_pct: float = 15.0):
+    """Median color within a circular ROI, after dropping the brightest
+    and darkest `clip_pct` percent of pixels by luminance (removes
+    specular-highlight and shadow pixels rather than blending them into
+    the average). Returns (median_rgb, n_pixels_kept) or None if the ROI
+    falls outside the image."""
+    h, w = rgb_img.shape[:2]
+    cx, cy = int(center[0]), int(center[1])
+    if not (0 <= cx < w and 0 <= cy < h):
+        return None
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), radius, 255, -1)
+    pixels = rgb_img[mask == 255].reshape(-1, 3).astype(np.float64)
+    if pixels.shape[0] == 0:
+        return None
+
+    luminance = pixels @ np.array([0.299, 0.587, 0.114])
+    lo, hi = np.percentile(luminance, [clip_pct, 100 - clip_pct])
+    keep = (luminance >= lo) & (luminance <= hi)
+    kept = pixels[keep] if np.any(keep) else pixels
+
+    median_rgb = np.median(kept, axis=0)
+    return median_rgb, int(kept.shape[0])
+
+
+def extract_skin_regions(bgr_img: np.ndarray, radius_factor: float = 0.10) -> SkinSampleResult:
+    """Detect the face and sample raw color at each of the 4 ROIs above.
+    radius_factor scales with interpupillary distance so the ROI size
+    adapts to how close/far the face is in the photo."""
+    h, w = bgr_img.shape[:2]
+    rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+
+    face_mesh = _get_face_mesh()
+    results = face_mesh.process(rgb)
+    if not results.multi_face_landmarks:
+        return SkinSampleResult(False, "사진에서 얼굴을 찾지 못했어요")
+
+    landmarks = results.multi_face_landmarks[0].landmark
+
+    iris_a = _landmark_px(landmarks, LEFT_IRIS_CENTER_IDX, w, h)
+    iris_b = _landmark_px(landmarks, RIGHT_IRIS_CENTER_IDX, w, h)
+    interpupillary_dist = float(np.linalg.norm(iris_a - iris_b))
+    radius = max(5, int(interpupillary_dist * radius_factor))
+
+    regions = []
+    for name, idx in REGION_LANDMARKS.items():
+        center = _landmark_px(landmarks, idx, w, h)
+        sampled = _sample_region(rgb, center, radius)
+        if sampled is None:
+            continue
+        median_rgb, n_used = sampled
+        regions.append(
+            SkinRegionSample(
+                name=name,
+                raw_rgb=median_rgb,
+                center=(int(center[0]), int(center[1])),
+                radius=radius,
+                n_pixels_used=n_used,
+            )
+        )
+
+    if not regions:
+        return SkinSampleResult(
+            False,
+            "피부색 샘플링 영역이 사진 범위를 벗어났어요 (얼굴이 더 잘 보이게 다시 촬영해주세요)",
+        )
+
+    return SkinSampleResult(
+        True, "피부색 샘플 추출 완료", regions=regions, interpupillary_dist=interpupillary_dist
+    )
