@@ -74,7 +74,14 @@ def _get_landmarker():
         _landmarker_init_error = f"얼굴 인식 모델 파일이 없어요 ({MODEL_PATH})"
         return None
     try:
-        base_options = mp_core.base_options.BaseOptions(model_asset_path=MODEL_PATH)
+        # Force CPU delegate: Streamlit Cloud's servers have no GPU, and
+        # mediapipe's GPU delegate pulls in EGL/OpenGL shared libraries
+        # (libEGL.so.1) that aren't installed there by default -- explicitly
+        # requesting CPU avoids needing those libraries at all.
+        base_options = mp_core.base_options.BaseOptions(
+            model_asset_path=MODEL_PATH,
+            delegate=mp_core.base_options.BaseOptions.Delegate.CPU,
+        )
         options = mp_vision.FaceLandmarkerOptions(
             base_options=base_options,
             num_faces=1,
