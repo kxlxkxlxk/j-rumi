@@ -475,7 +475,18 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
     matched_observed = observed_rgb[row_ind]
     matched_reference = np.array(REFERENCE_RGB_LIST)[col_ind]
 
-    M = solve_correction_matrix(matched_observed, matched_reference)
+    # A patch with a channel pinned at (near) 0 or 255 is clipped/blown out
+    # (usually the white patch catching a specular highlight) -- its
+    # "observed" color isn't real, so fitting the correction matrix to it
+    # distorts the whole transform. Fit on the non-clipped patches only,
+    # but fall back to using everything if too many are clipped (e.g. a
+    # very harshly lit photo) so we don't end up with too few equations.
+    clip_lo, clip_hi = 3, 252
+    not_clipped = ~np.any((matched_observed <= clip_lo) | (matched_observed >= clip_hi), axis=1)
+    fit_observed = matched_observed[not_clipped] if not_clipped.sum() >= 12 else matched_observed
+    fit_reference = matched_reference[not_clipped] if not_clipped.sum() >= 12 else matched_reference
+
+    M = solve_correction_matrix(fit_observed, fit_reference)
 
     corrected = np.array([apply_correction(o, M) for o in matched_observed])
     mean_err = float(np.mean(np.linalg.norm(corrected - matched_reference, axis=1)))
