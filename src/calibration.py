@@ -2,20 +2,29 @@
 ColorChecker Classic (24-patch) detection + color-correction calibration.
 
 Pipeline:
-  1. Find the black card in the photo (largest dark quadrilateral contour).
-  2. Perspective-warp it to a flat canonical rectangle.
-  3. Detect the 24 individual color patches inside the warped card.
-  4. Sample each patch's color (robust median of a central crop).
-  5. Match the 24 sampled colors to the 24 known reference colors
-     (Hungarian assignment on color distance -- works regardless of the
-     card's rotation/orientation in the photo).
-  6. Solve a linear color-correction transform (observed -> reference).
+  1. Propose several candidate quadrilaterals for where the card might be,
+     using multiple independent segmentation strategies (see
+     `_candidate_quads` below) -- deliberately liberal, since a real photo
+     can have hair/clothing/jewelry that looks card-like to any one of
+     them on its own.
+  2. For EVERY candidate: perspective-warp it, detect the 24 patches
+     inside, and check how well their colors match the card's actual
+     known reference colors (Hungarian-matched CIEDE... well, Euclidean
+     RGB distance here, then a proper affine solve). This is the real
+     filter: a hair/clothing/jewelry region will not have anything
+     resembling a match to the specific 24 reference colors, so its
+     error stays high, while the true card (even from an imperfectly
+     segmented candidate) matches closely.
+  3. Keep only the candidate with the lowest resulting color-matching
+     error. This makes automatic detection robust without needing a
+     person to manually crop the card -- the known, fixed set of colors
+     on the card is itself the strongest signal for "this is the card".
 
-The same `find_card_and_correction()` function is used both when building
-the foundation DB (photo of card + foundation swatch) and when a user
-submits a face photo (photo of card + face) -- in both cases we first
-figure out "what this camera/lighting did to a known color" and correct
-the *other* thing in the same photo by the same transform.
+The same `calibrate_from_image()` function is used both when building the
+foundation DB (photo of card + foundation swatch) and when a user submits
+a face photo (photo of card + face) -- in both cases we first figure out
+"what this camera/lighting did to a known color" and correct the *other*
+thing in the same photo by the same transform.
 """
 
 from dataclasses import dataclass
@@ -23,9 +32,30 @@ import numpy as np
 import cv2
 from scipy.optimize import linear_sum_assignment
 
-from .reference_colors import REFERENCE_RGB_LIST, REFERENCE_NAMES
+from .reference_colors import REFERENCE_RGB_LIST, REFERENCE_PATCHES, REFERENCE_NAMES
 
 CANONICAL_W, CANONICAL_H = 1200, 800  # landscape canonical warp size (~3:2 card)
+
+# The 6 most saturated ColorChecker Classic patches (the "primary/secondary"
+# row: blue, green, red, yellow, magenta, cyan). Real skin, hair, and most
+# clothing fall well outside these hues at this saturation, which makes
+# them a strong, specific signal for "this pixel belongs to a card patch" --
+# used by `_hue_grid_candidates` below to find the card by its own known
+# colors directly, rather than by any generic brightness/texture heuristic.
+_SATURATED_PATCH_NAMES = ("blue", "green", "red", "yellow", "magenta", "cyan")
+
+
+def _target_hues():
+    hues = []
+    for name in _SATURATED_PATCH_NAMES:
+        rgb = REFERENCE_PATCHES[name]
+        bgr_px = np.uint8([[list(rgb[::-1])]])
+        hsv_px = cv2.cvtColor(bgr_px, cv2.COLOR_BGR2HSV)[0, 0]
+        hues.append(int(hsv_px[0]))
+    return hues
+
+
+_TARGET_HUES = _target_hues()
 
 
 @dataclass
@@ -38,6 +68,7 @@ class CalibrationResult:
     patch_centers_canonical: np.ndarray = None
     observed_patch_rgb: np.ndarray = None
     matched_reference_rgb: np.ndarray = None
+    n_candidates_tried: int = None
 
 
 def _order_quad_points(pts: np.ndarray) -> np.ndarray:
@@ -52,12 +83,17 @@ def _order_quad_points(pts: np.ndarray) -> np.ndarray:
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-def _largest_quad_from_mask(mask: np.ndarray, img_area: int):
+def _quad_candidates_from_mask(mask: np.ndarray, img_area: int, fill_thresh: float = 0.55, max_candidates: int = 6):
+    """Return up to `max_candidates` plausible card-shaped quads from a
+    binary mask, sorted largest-first. Deliberately loose (fill_thresh
+    lower than you'd want for a final answer) -- real detection accuracy
+    is enforced later by the color-matching check, not by geometry alone.
+    """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < img_area * 0.01 or area > img_area * 0.95:
+        if area < img_area * 0.005 or area > img_area * 0.95:
             continue
         rect = cv2.minAreaRect(c)
         box = cv2.boxPoints(rect)
@@ -71,50 +107,200 @@ def _largest_quad_from_mask(mask: np.ndarray, img_area: int):
         if short_side < 1:
             continue
         aspect = long_side / short_side
-        # ColorChecker Classic is roughly 1.4-1.6 : 1
-        if 1.2 < aspect < 2.0:
-            # how well the contour fills its own rotated bounding box
-            # (rejects L-shaped / partial blobs)
+        # ColorChecker Classic is roughly 1.4-1.6 : 1 -- kept a bit wider
+        # than that here since the color check downstream is the real filter.
+        if 1.05 < aspect < 2.3:
             rect_area = short_side * long_side
             fill = area / rect_area if rect_area > 0 else 0
-            if fill > 0.75:
+            if fill > fill_thresh:
                 candidates.append((area, quad))
-    if not candidates:
-        return None
     candidates.sort(key=lambda x: -x[0])
-    return candidates[0][1]
+    return [q for _, q in candidates[:max_candidates]]
 
 
-def find_card_quad(bgr_img: np.ndarray):
-    """Locate the ColorChecker's outer black border as a quadrilateral.
+def _color_variance_map(bgr_img: np.ndarray, win: int = 15) -> np.ndarray:
+    """Local per-pixel color variance (sum over B,G,R of a windowed
+    variance). The card's checkerboard is far more locally varied --
+    tiny adjacent cells of wildly different colors -- than skin, hair, or
+    most clothing, which makes this a useful *extra* candidate-generation
+    signal alongside the brightness-based one below (neither alone is
+    reliable on a busy real photo, which is exactly why we generate
+    candidates from both and let the color-match check pick the winner)."""
+    img = bgr_img.astype(np.float64)
+    mean = cv2.boxFilter(img, ddepth=-1, ksize=(win, win))
+    sq_mean = cv2.boxFilter(img * img, ddepth=-1, ksize=(win, win))
+    var = np.clip(sq_mean - mean * mean, 0, None)
+    return var.sum(axis=2)
 
-    The card frame is near-black against a much brighter, fairly uniform
-    background, so a single global (Otsu) threshold on brightness cleanly
-    separates the two -- adaptive thresholding was tried first but broke
-    the frame into disconnected pieces under shading gradients.
+
+def _saturated_hue_mask(bgr_img: np.ndarray, sat_min: int = 90, val_range=(40, 245), hue_tol: int = 14) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+    H, S, V = hsv[..., 0].astype(int), hsv[..., 1], hsv[..., 2]
+    base = (S > sat_min) & (V > val_range[0]) & (V < val_range[1])
+    hit = np.zeros(base.shape, dtype=bool)
+    for target in _TARGET_HUES:
+        d = np.minimum(np.abs(H - target), 180 - np.abs(H - target))
+        hit |= d < hue_tol
+    return (base & hit).astype(np.uint8) * 255
+
+
+def _small_squares_from_mask(mask: np.ndarray, img_area: int):
+    """Individual small squarish blobs (single-patch scale) in a mask --
+    deliberately NOT closed/merged into one big blob first, so a patch
+    grid shows up as many separate small boxes rather than needing to
+    already be one clean connected region."""
+    m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < img_area * 0.0008 or area > img_area * 0.04:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        ar = bw / float(bh)
+        if 0.4 < ar < 2.5:
+            boxes.append((x, y, bw, bh))
+    return boxes
+
+
+def _largest_grid_cluster(boxes, spacing_factor: float = 2.4, min_members: int = 6):
+    """Group candidate squares by mutual proximity (union-find over a
+    'closer than ~2.4 patch-widths' graph) and return the largest group.
+    The card's 24 patches sit close together on a regular grid, so they
+    form one dense cluster; a stray hit elsewhere (an eye, a ring, a
+    fleck on clothing) sits far from the others and ends up alone or in
+    a tiny cluster, which this discards."""
+    if len(boxes) < min_members:
+        return None
+    centers = np.array([(x + bw / 2, y + bh / 2) for x, y, bw, bh in boxes])
+    sizes = np.array([(bw + bh) / 2 for x, y, bw, bh in boxes])
+    thresh = float(np.median(sizes)) * spacing_factor
+
+    n = len(centers)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(centers[i] - centers[j]) < thresh:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    best_group = max(groups.values(), key=len)
+    if len(best_group) < min_members:
+        return None
+    return [boxes[i] for i in best_group], float(np.median(sizes))
+
+
+def _hue_grid_candidates(bgr_img: np.ndarray, pad_factors=(0.5, 0.8, 1.1, 1.4)):
+    """Find the card by looking directly for its own known vivid colors
+    (see _SATURATED_PATCH_NAMES) arranged in a tight, regular grid --
+    this is the most specific signal available (skin/hair/most clothing
+    simply don't have 6+ small patches of these exact hues sitting right
+    next to each other on a grid) and is what lets automatic detection
+    work even with dark hair or patterned clothing right next to the
+    card. Runs on a downscaled copy for speed/parameter-stability, then
+    scales the result back up to bgr_img's own resolution.
+    """
+    h, w = bgr_img.shape[:2]
+    work_scale = 900 / max(h, w)
+    small = cv2.resize(bgr_img, None, fx=work_scale, fy=work_scale) if work_scale < 1 else bgr_img
+    sh, sw = small.shape[:2]
+    img_area = sh * sw
+
+    mask = _saturated_hue_mask(small)
+    boxes = _small_squares_from_mask(mask, img_area)
+    clustered = _largest_grid_cluster(boxes)
+    if clustered is None:
+        return []
+    cluster_boxes, median_size = clustered
+
+    pts = []
+    for x, y, bw, bh in cluster_boxes:
+        pts.append((x, y))
+        pts.append((x + bw, y + bh))
+    pts = np.array(pts, dtype=np.float32)
+
+    quads = []
+    for pad_factor in pad_factors:
+        pad = median_size * pad_factor
+        rect = cv2.minAreaRect(pts)
+        (cx, cy), (rw, rh), ang = rect
+        padded_rect = ((cx, cy), (rw + 2 * pad, rh + 2 * pad), ang)
+        box = cv2.boxPoints(padded_rect)
+        quad = _order_quad_points(box)
+        if work_scale < 1:
+            quad = quad / work_scale
+        quads.append(quad.astype(np.float32))
+    return quads
+
+
+def _candidate_quads(bgr_img: np.ndarray):
+    """Gather a pool of candidate card quads from several independent
+    segmentation strategies. Intentionally over-generates (and tolerates
+    duplicates/near-duplicates -- calibrate_from_image dedupes by trying
+    each and skipping ones whose center is very close to an already-tried
+    one) since the color-matching check downstream is what actually
+    decides which candidate is the real card.
     """
     h, w = bgr_img.shape[:2]
     img_area = h * w
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
 
-    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    otsu = cv2.morphologyEx(otsu, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    quad = _largest_quad_from_mask(otsu, img_area)
-    if quad is not None:
-        return quad
+    all_candidates = []
 
-    # Fallback: fixed low-brightness threshold in case Otsu's split point
-    # was skewed by a large dark background.
-    for cutoff in (40, 60, 80):
-        _, mask = cv2.threshold(blur, cutoff, 255, cv2.THRESH_BINARY_INV)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-        quad = _largest_quad_from_mask(mask, img_area)
-        if quad is not None:
-            return quad
-    return None
+    # Strategy D (tried first -- it's the most specific signal): the
+    # card's own known vivid colors, arranged in a tight regular grid.
+    all_candidates.extend(_hue_grid_candidates(bgr_img))
+
+    # Strategy A: Otsu global threshold (dark card vs bright background),
+    # a couple of morphology strengths.
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    for ck, ok in ((9, 5), (5, 3), (13, 9)):
+        m = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, np.ones((ck, ck), np.uint8))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((ok, ok), np.uint8))
+        all_candidates.extend(_quad_candidates_from_mask(m, img_area))
+
+    # Strategy B: fixed brightness cutoffs (in case Otsu's split point is
+    # skewed by a large dark background/hair).
+    for cutoff in (40, 60, 80, 100):
+        _, m = cv2.threshold(blur, cutoff, 255, cv2.THRESH_BINARY_INV)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        all_candidates.extend(_quad_candidates_from_mask(m, img_area))
+
+    # Strategy C: local color-variance (catches the card even when it's
+    # sitting right next to similarly-dark hair/background).
+    var = _color_variance_map(bgr_img, win=15)
+    denom = max(float(np.percentile(var, 99.5)), 1.0)
+    var_norm = np.clip(var / denom * 255, 0, 255).astype(np.uint8)
+    _, vm = cv2.threshold(var_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for ck, ok in ((9, 5), (13, 7)):
+        m = cv2.morphologyEx(vm, cv2.MORPH_CLOSE, np.ones((ck, ck), np.uint8))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((ok, ok), np.uint8))
+        all_candidates.extend(_quad_candidates_from_mask(m, img_area))
+
+    return all_candidates
+
+
+def find_card_quad(bgr_img: np.ndarray):
+    """Backwards-compatible single-best-guess quad (kept for any external
+    callers/tests); calibrate_from_image itself uses the full candidate
+    pool + color-match validation instead of this."""
+    candidates = _candidate_quads(bgr_img)
+    return candidates[0] if candidates else None
 
 
 def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
@@ -158,18 +344,6 @@ def _find_bright_patch_boxes(warped_bgr: np.ndarray):
         if 0.5 < ar < 2.0:
             boxes.append((x, y, bw, bh))
     return boxes
-
-
-def _cluster_1d(values, min_gap):
-    """Group nearby scalar values into clusters; return sorted cluster means."""
-    values = sorted(values)
-    clusters = [[values[0]]]
-    for v in values[1:]:
-        if v - clusters[-1][-1] <= min_gap:
-            clusters[-1].append(v)
-        else:
-            clusters.append([v])
-    return [float(np.mean(c)) for c in clusters]
 
 
 def _kmeans_1d(values, k, n_iter=50):
@@ -273,20 +447,19 @@ def apply_correction(rgb: np.ndarray, M: np.ndarray) -> np.ndarray:
     return np.clip(corrected, 0, 255)
 
 
-def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
-    quad = find_card_quad(bgr_img)
-    if quad is None:
-        return CalibrationResult(False, "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게 다시 촬영해주세요)")
-
+def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
+    """Run the warp -> patch-detect -> color-match -> solve pipeline for
+    ONE candidate quad. Returns a CalibrationResult (success may be False
+    if this particular candidate didn't pan out -- that's expected for
+    most candidates; calibrate_from_image tries several and keeps the
+    best)."""
     warped = warp_card(bgr_img, quad)
     boxes = detect_patches(warped)
     if len(boxes) < 20:
-        return CalibrationResult(
-            False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)"
-        )
+        return CalibrationResult(False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)")
 
     observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
-    row_ind, col_ind, cost = match_patches_to_reference(observed_rgb)
+    row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb)
 
     matched_observed = observed_rgb[row_ind]
     matched_reference = np.array(REFERENCE_RGB_LIST)[col_ind]
@@ -308,3 +481,63 @@ def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
         observed_patch_rgb=matched_observed,
         matched_reference_rgb=matched_reference,
     )
+
+
+# A candidate whose best achievable color-matching error is above this is
+# treated as "not actually the card" (e.g. a patch of striped shirt or
+# jewelry that happened to look card-shaped), even if it was the geometric
+# front-runner. The real card, even under fairly rough lighting, comes in
+# well under this.
+MAX_ACCEPTABLE_MEAN_ERROR = 55.0
+
+
+def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
+    """Automatically find and calibrate against the ColorChecker card.
+
+    Rather than trusting a single "most likely" card-shaped region, this
+    tries every plausible candidate region from `_candidate_quads` and
+    keeps whichever one actually matches the card's known reference
+    colors best -- since the 24 reference colors are fixed and known in
+    advance, "how well do this region's colors match them" is a much
+    stronger and more specific test than any purely geometric guess, and
+    is what lets this stay fully automatic even when hair, clothing
+    patterns, or jewelry are right next to the card in the photo.
+    """
+    candidates = _candidate_quads(bgr_img)
+    if not candidates:
+        return CalibrationResult(False, "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게 다시 촬영해주세요)")
+
+    h, w = bgr_img.shape[:2]
+    dedupe_radius = 0.03 * max(h, w)
+    # Dedupe on (center, size) together -- two quads can share a center but
+    # be genuinely different candidates (e.g. the same hue-grid cluster
+    # padded by different amounts), so center proximity alone must not
+    # skip one of them.
+    tried = []  # list of (center, diag)
+    best = None
+
+    for quad in candidates:
+        center = quad.mean(axis=0)
+        diag = float(np.linalg.norm(quad[2] - quad[0]))  # corner-to-corner size
+        is_dup = any(
+            np.linalg.norm(center - c) < dedupe_radius and abs(diag - d) < 0.15 * max(diag, d)
+            for c, d in tried
+        )
+        if is_dup:
+            continue
+        tried.append((center, diag))
+
+        result = _try_calibrate_candidate(bgr_img, quad)
+        if not result.success:
+            continue
+        if best is None or result.mean_delta_e < best.mean_delta_e:
+            best = result
+
+    if best is None or best.mean_delta_e > MAX_ACCEPTABLE_MEAN_ERROR:
+        return CalibrationResult(
+            False,
+            "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게, 너무 어둡지 않은 곳에서 다시 촬영해주세요)",
+        )
+
+    best.n_candidates_tried = len(tried)
+    return best
