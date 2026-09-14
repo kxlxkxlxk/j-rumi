@@ -41,34 +41,81 @@ def _pairwise_delta_e(lab_list) -> np.ndarray:
     return d
 
 
-def _select_medoid(region_labs, outlier_factor: float = 1.8):
+def _agreement_clusters(dist: np.ndarray, threshold: float):
+    """Union-find over region indices: connect i,j whenever their
+    perceptual distance is within `threshold` (i.e. they plausibly read
+    the same real skin tone). Returns a list of clusters (each a list of
+    indices)."""
+    n = dist.shape[0]
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist[i, j] <= threshold:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def _select_medoid(region_labs, agreement_threshold: float = 8.0):
     """1) Compute pairwise CIEDE2000 distance between every ROI's Lab.
-    2) The medoid is the ROI whose total distance to all others is
-       smallest (the one the rest most agree with).
-    3) Any ROI much farther from the medoid than the typical pairwise
-       distance is dropped as an outlier, then the medoid is recomputed
-       among the rest.
+    2) Group ROIs into clusters of mutual agreement (perceptually close
+       to each other, within agreement_threshold) via union-find.
+    3) Take the LARGEST cluster -- the set of regions that most agree
+       with each other on a skin tone. Ties are broken by which cluster
+       is internally tightest (lowest average pairwise distance): if two
+       clusters are the same size, the one where members agree more
+       closely with each other is more likely to be measuring real,
+       evenly-lit skin rather than a mix contaminated by shadow/highlight.
+    4) Within that cluster, the medoid is the member closest (by total
+       distance) to the rest of the cluster.
+
+    This replaces a plain "closest to everyone" medoid, which can pick
+    the wrong side on an even split -- e.g. 2 well-lit cheek ROIs that
+    closely agree with each other vs. 2 shadowed under-mouth/chin ROIs
+    that also loosely agree with each other: summing distance to ALL
+    other regions lets one shadowed region "win" by a hair even though
+    the other side is the tighter, more mutually-consistent group.
     Returns (final_lab, medoid_index, kept_indices, dist_matrix)."""
     n = len(region_labs)
     if n == 1:
         return region_labs[0], 0, [0], np.zeros((1, 1))
 
     dist = _pairwise_delta_e(region_labs)
-    totals = dist.sum(axis=1)
-    medoid_idx = int(np.argmin(totals))
 
-    off_diag = dist[dist > 0]
-    median_pairwise = float(np.median(off_diag)) if off_diag.size else 0.0
-    # ΔE < ~3 is close to "barely perceptible" -- don't prune on noise alone
-    threshold = max(median_pairwise * outlier_factor, 3.0)
-    kept = [i for i in range(n) if dist[i, medoid_idx] <= threshold]
+    clusters = _agreement_clusters(dist, agreement_threshold)
+    max_size = max(len(c) for c in clusters)
+    largest = [c for c in clusters if len(c) == max_size]
 
-    if 2 <= len(kept) < n:
+    def _tightness(cluster):
+        if len(cluster) == 1:
+            return 0.0
+        pairs = [dist[i, j] for a, i in enumerate(cluster) for j in cluster[a + 1 :]]
+        return float(np.mean(pairs))
+
+    largest.sort(key=_tightness)
+    kept = largest[0]
+
+    if len(kept) == 1:
+        medoid_idx = kept[0]
+    else:
         sub_dist = dist[np.ix_(kept, kept)]
         sub_totals = sub_dist.sum(axis=1)
         medoid_idx = kept[int(np.argmin(sub_totals))]
-    else:
-        kept = list(range(n))
 
     return region_labs[medoid_idx], medoid_idx, kept, dist
 
