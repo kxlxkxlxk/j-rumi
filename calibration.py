@@ -32,7 +32,12 @@ import numpy as np
 import cv2
 from scipy.optimize import linear_sum_assignment
 
-from .reference_colors import REFERENCE_RGB_LIST, REFERENCE_PATCHES, REFERENCE_NAMES
+from .reference_colors import (
+    REFERENCE_RGB_LIST,
+    REFERENCE_PATCHES,
+    REFERENCE_NAMES,
+    get_active_reference_rgb_list,
+)
 
 CANONICAL_W, CANONICAL_H = 1200, 800  # landscape canonical warp size (~3:2 card)
 
@@ -303,7 +308,10 @@ def find_card_quad(bgr_img: np.ndarray):
     return candidates[0] if candidates else None
 
 
-def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
+def _warp_card_with_transform(bgr_img: np.ndarray, quad: np.ndarray):
+    """Same as warp_card, but also returns the perspective matrix and
+    canonical output size -- needed by _refine_quad_from_patches below to
+    map a correction back the other way (canonical -> original image)."""
     side_w = max(
         np.linalg.norm(quad[1] - quad[0]), np.linalg.norm(quad[2] - quad[3])
     )
@@ -319,7 +327,149 @@ def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
     )
     M = cv2.getPerspectiveTransform(quad, dst)
     warped = cv2.warpPerspective(bgr_img, M, (out_w, out_h))
+    return warped, M, out_w, out_h
+
+
+def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
+    warped, _M, _out_w, _out_h = _warp_card_with_transform(bgr_img, quad)
     return warped
+
+
+def _refine_quad_from_patches(quad, boxes, M, out_w, out_h, orig_shape, border_units: float = -0.05):
+    """The initial candidate quad (from _candidate_quads) is only a rough
+    guess -- e.g. the hue-grid strategy pads a tight cluster of detected
+    color patches outward by an assumed, fixed proportion to estimate
+    where the card's actual edge is, which can overshoot (even past the
+    photo's own edge on some tilts/angles) or undershoot depending on how
+    the card sits in the frame, and can leave the card still sitting at a
+    slight angle in the warped preview instead of flat.
+
+    Picking any single corner (or 4 corners) of the grid to anchor a
+    refit is fragile: the corner cells are exactly the ones most likely
+    to be inferred/extrapolated rather than directly detected (dark
+    patches like black_20 aren't picked up by the bright-patch contour
+    step at all), so their individual position error is the highest of
+    any cell in the grid -- basing the whole refit on just those 4 points
+    means inheriting their worst-case error. Using all 24 detected patch
+    centers is far more robust: we know their IDEAL positions exactly (a
+    perfect 6x4 grid of unit cells, since that's the ColorChecker
+    Classic's fixed physical layout) and can fit a single homography
+    mapping that ideal grid to where the centers actually landed in this
+    warp -- a 24-point least-squares fit averages out any one cell's
+    noise instead of being dictated by it.
+
+    `border_units` (in the same unit-cell scale) is deliberately small
+    and slightly NEGATIVE by default: trying to extrapolate all the way
+    out to the card's true physical edge (past the patches, out to its
+    printed black border) turned out to be unreliable in practice -- any
+    real camera has a little lens distortion a single homography can't
+    model, and that error only grows when extrapolated beyond the fitted
+    points, which is exactly what produced the persistent sliver of
+    background this replaces. Landing slightly INSIDE the outermost
+    patches instead is a much safer bet: it can never expose background,
+    since it never leaves the region we actually, directly observed to
+    be patch color, at the cost of not showing the card's own printed
+    border in the preview -- a fine trade since only the 24 patch colors
+    need to stay legible, not the card's physical frame. Mapping those 4
+    points back through the INVERSE of this warp into the original
+    image, then re-warping with them, "pulls"/stretches the patches to
+    fill the whole canonical frame in one shot.
+    """
+    n = len(boxes)
+    n_cols, n_rows = (6, 4) if out_w >= out_h else (4, 6)
+
+    if n != n_cols * n_rows:
+        # Not the expected clean grid -- fall back to a plain padded
+        # bounding box (still an improvement over the original rough quad).
+        xs0 = [x for (x, y, bw, bh) in boxes]
+        ys0 = [y for (x, y, bw, bh) in boxes]
+        xs1 = [x + bw for (x, y, bw, bh) in boxes]
+        ys1 = [y + bh for (x, y, bw, bh) in boxes]
+        median_w = float(np.median([bw for (_, _, bw, _bh) in boxes]))
+        median_h = float(np.median([bh for (_, _, _bw, bh) in boxes]))
+        margin_x, margin_y = median_w * 0.25, median_h * 0.25
+        x0 = max(0.0, min(xs0) - margin_x)
+        y0 = max(0.0, min(ys0) - margin_y)
+        x1 = min(float(out_w), max(xs1) + margin_x)
+        y1 = min(float(out_h), max(ys1) + margin_y)
+        canonical_corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+    else:
+        # boxes is in deterministic row-major grid order (see
+        # detect_patches: `for cy in row_ys: for cx in col_xs: ...`).
+        centers = np.array(
+            [[x + bw / 2.0, y + bh / 2.0] for (x, y, bw, bh) in boxes], dtype=np.float64
+        )
+        ideal = np.array(
+            [[c + 0.5, r + 0.5] for r in range(n_rows) for c in range(n_cols)],
+            dtype=np.float64,
+        )
+
+        H, _mask = cv2.findHomography(ideal, centers, method=0)
+
+        ideal_card_corners = np.array(
+            [
+                [-border_units, -border_units],
+                [n_cols + border_units, -border_units],
+                [n_cols + border_units, n_rows + border_units],
+                [-border_units, n_rows + border_units],
+            ],
+            dtype=np.float64,
+        )
+        ones = np.ones((4, 1), dtype=np.float64)
+        homog = np.hstack([ideal_card_corners, ones])
+        canonical_mapped = (H @ homog.T).T
+        canonical_corners = canonical_mapped[:, :2] / canonical_mapped[:, 2:3]
+
+    canonical_corners[:, 0] = np.clip(canonical_corners[:, 0], 0, out_w)
+    canonical_corners[:, 1] = np.clip(canonical_corners[:, 1], 0, out_h)
+
+    M_inv = np.linalg.inv(M)
+    ones = np.ones((4, 1), dtype=np.float64)
+    homog = np.hstack([canonical_corners, ones])
+    mapped = (M_inv @ homog.T).T
+    mapped = mapped[:, :2] / mapped[:, 2:3]
+
+    h_img, w_img = orig_shape[:2]
+    mapped[:, 0] = np.clip(mapped[:, 0], 0, w_img - 1)
+    mapped[:, 1] = np.clip(mapped[:, 1], 0, h_img - 1)
+
+    return mapped.astype(np.float32)
+
+
+def _warp_and_detect_refined(bgr_img: np.ndarray, quad: np.ndarray, n_refine_passes: int = 2):
+    """Rough warp + patch-detect pass, then up to `n_refine_passes` rounds
+    of _refine_quad_from_patches (see there for why one pass is needed at
+    all). A tilted card can need more than one round to fully converge --
+    each pass re-derives the quad from where the patches actually landed
+    in the PREVIOUS pass's warp, so residual skew shrinks with each round
+    instead of needing to be fully corrected in one shot. Stops early once
+    a pass stops finding more patches (no more room to improve) or the
+    quad barely moves. Always keeps the best (most-patches-found) result
+    seen, so a bad later pass can never make things worse than an earlier
+    good one. Returns (quad_used, warped_used, boxes_used)."""
+    warped, M, out_w, out_h = _warp_card_with_transform(bgr_img, quad)
+    boxes = detect_patches(warped)
+    if len(boxes) < 20:
+        return quad, warped, boxes
+
+    best_quad, best_warped, best_boxes = quad, warped, boxes
+
+    for _ in range(n_refine_passes):
+        refined_quad = _refine_quad_from_patches(
+            best_quad, best_boxes, M, out_w, out_h, bgr_img.shape
+        )
+        if np.allclose(refined_quad, best_quad, atol=1.0):
+            break  # converged -- another pass wouldn't change anything
+        refined_warped, M, out_w, out_h = _warp_card_with_transform(bgr_img, refined_quad)
+        refined_boxes = detect_patches(refined_warped)
+        if len(refined_boxes) < 20:
+            break
+        if len(refined_boxes) >= len(best_boxes):
+            best_quad, best_warped, best_boxes = refined_quad, refined_warped, refined_boxes
+        else:
+            break
+
+    return best_quad, best_warped, best_boxes
 
 
 def _find_bright_patch_boxes(warped_bgr: np.ndarray):
@@ -418,9 +568,19 @@ def _sample_patch_color(warped_bgr: np.ndarray, box):
     return median_bgr[::-1]  # -> RGB
 
 
-def match_patches_to_reference(observed_rgb: np.ndarray):
-    """Hungarian-match observed patch colors to the 24 known reference colors."""
-    ref = np.array(REFERENCE_RGB_LIST, dtype=np.float64)
+def match_patches_to_reference(observed_rgb: np.ndarray, reference_rgb_list=None):
+    """Hungarian-match observed patch colors to the 24 known reference
+    colors. reference_rgb_list defaults to the ACTIVE reference (a custom
+    one captured from the admin page's "clean card photo" flow if one has
+    been saved, else the standard official ColorChecker values) -- see
+    reference_colors.get_active_reference_rgb_list(). Passing the default
+    REFERENCE_RGB_LIST explicitly is only for the one place that must
+    always use the official values regardless of any custom reference:
+    capture_card_reference() below, when establishing a NEW custom
+    reference in the first place."""
+    if reference_rgb_list is None:
+        reference_rgb_list = get_active_reference_rgb_list()
+    ref = np.array(reference_rgb_list, dtype=np.float64)
     obs = np.array(observed_rgb, dtype=np.float64)
     n = min(len(ref), len(obs))
     cost = np.zeros((len(obs), len(ref)))
@@ -458,40 +618,130 @@ def apply_correction_image(rgb_img: np.ndarray, M: np.ndarray) -> np.ndarray:
     return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
+# How much of the full card-based correction to actually apply, from 0.0
+# (no correction at all) to 1.0 (the full, mathematically "correct"
+# camera/lighting correction). The reference app ("제루미") the product
+# owner is matching against visibly applies a much milder correction than
+# the full physically-derived one -- e.g. for one test photo, the full
+# correction moves the skin color by ΔE00≈10.3, while the reference app's
+# own before/after only moves it by ΔE00≈2.5. Blending the fitted matrix
+# toward the identity transform at strength≈0.3 reproduces that same,
+# gentler magnitude (~ΔE00 3.0 on the same test case) while still pointing
+# in the same (camera-bias-correcting) direction. This is a deliberate,
+# tunable product choice, not a bug fix -- turning it up trades a more
+# "technically correct" (but visually stronger) correction for matching
+# the reference app's subtler look; turning it down or up is just editing
+# this one constant.
+CORRECTION_STRENGTH = 0.3
+
+
 def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
     """Run the warp -> patch-detect -> color-match -> solve pipeline for
     ONE candidate quad. Returns a CalibrationResult (success may be False
     if this particular candidate didn't pan out -- that's expected for
     most candidates; calibrate_from_image tries several and keeps the
     best)."""
-    warped = warp_card(bgr_img, quad)
-    boxes = detect_patches(warped)
+    quad, warped, boxes = _warp_and_detect_refined(bgr_img, quad)
     if len(boxes) < 20:
         return CalibrationResult(False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)")
 
     observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
-    row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb)
+    active_reference = get_active_reference_rgb_list()
+    row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb, active_reference)
 
     matched_observed = observed_rgb[row_ind]
-    matched_reference = np.array(REFERENCE_RGB_LIST)[col_ind]
+    matched_reference = np.array(active_reference)[col_ind]
 
-    M = solve_correction_matrix(matched_observed, matched_reference)
+    # A patch with a channel pinned at (near) 0 or 255 is clipped/blown out
+    # (usually the white patch catching a specular highlight) -- its
+    # "observed" color isn't real, so fitting the correction matrix to it
+    # distorts the whole transform. Fit on the non-clipped patches only,
+    # but fall back to using everything if too many are clipped (e.g. a
+    # very harshly lit photo) so we don't end up with too few equations.
+    clip_lo, clip_hi = 3, 252
+    not_clipped = ~np.any((matched_observed <= clip_lo) | (matched_observed >= clip_hi), axis=1)
+    fit_observed = matched_observed[not_clipped] if not_clipped.sum() >= 12 else matched_observed
+    fit_reference = matched_reference[not_clipped] if not_clipped.sum() >= 12 else matched_reference
 
+    M = solve_correction_matrix(fit_observed, fit_reference)
+
+    # mean_err (and thus which candidate quad "wins" in calibrate_from_image)
+    # is deliberately measured against the FULL-strength matrix, not the
+    # blended one below -- it's a measure of how well the card itself was
+    # detected/read, which shouldn't change just because we've since decided
+    # to apply a gentler correction to the final photo.
     corrected = np.array([apply_correction(o, M) for o in matched_observed])
     mean_err = float(np.mean(np.linalg.norm(corrected - matched_reference, axis=1)))
+
+    # Blend the fitted correction toward "do nothing" (identity) so the
+    # correction actually applied to the photo is milder than the full,
+    # physically-derived one -- see CORRECTION_STRENGTH above.
+    M_identity = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+    M_applied = CORRECTION_STRENGTH * M + (1 - CORRECTION_STRENGTH) * M_identity
 
     centers = np.array([[x + bw / 2, y + bh / 2] for (x, y, bw, bh) in boxes])
 
     return CalibrationResult(
         True,
         f"카드 {len(boxes)}개 패치 인식 완료, 평균 보정 오차 {mean_err:.1f}",
-        correction_matrix=M,
+        correction_matrix=M_applied,
         mean_delta_e=mean_err,
         card_corners=quad,
         patch_centers_canonical=centers[row_ind],
         observed_patch_rgb=matched_observed,
         matched_reference_rgb=matched_reference,
     )
+
+
+def capture_card_reference(bgr_img: np.ndarray):
+    """For the admin "카드 기준값 재설정" flow: given ONE clean, well-lit,
+    straight-on photo of just the physical card (no face, no glare), find
+    it and return its 24 patch colors AS OBSERVED -- no correction
+    applied. These raw observed values are meant to be saved as the new
+    correction TARGET (see reference_colors.get_active_reference_patches /
+    github_storage.write_card_reference), replacing the standard official
+    Calibrite/X-Rite numbers with what this specific physical card and
+    camera combination actually reads under good light. A printed card
+    can drift a bit from the published spec (printing batch, aging), so
+    this can be more accurate for THIS card than the official table.
+
+    Patches are identified (which detected square is "orange_yellow" vs
+    "light_skin" etc.) by nearest-match to the STANDARD official
+    reference colors, regardless of any custom reference already active
+    -- that's only for figuring out which patch is which, not for the
+    value that gets stored.
+
+    Requires all 24 patches to be found (stricter than the normal ~20/24
+    tolerance used on real face photos) since the whole point is a clean,
+    reliable baseline. Returns (success, message, patches_dict_or_None)
+    where patches_dict is {name: [R, G, B]}.
+    """
+    candidates = _candidate_quads(bgr_img)
+    if not candidates:
+        return False, "카드를 사진에서 찾지 못했어요 — 카드만 크고 선명하게 나오도록 다시 찍어주세요", None
+
+    best = None
+    for quad in candidates:
+        quad, warped, boxes = _warp_and_detect_refined(bgr_img, quad)
+        if len(boxes) < 20:
+            continue
+        observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
+        row_ind, col_ind, cost = match_patches_to_reference(observed_rgb, REFERENCE_RGB_LIST)
+        total_cost = float(cost[row_ind, col_ind].sum())
+        if best is None or total_cost < best[0]:
+            best = (total_cost, row_ind, col_ind, observed_rgb)
+
+    if best is None:
+        return False, "카드 패치를 충분히 찾지 못했어요 — 반사·그림자 없이 카드가 꽉 차게 다시 찍어주세요", None
+
+    _cost, row_ind, col_ind, observed_rgb = best
+    if len(row_ind) < 24:
+        return False, f"24개 중 {len(row_ind)}개 패치만 인식됐어요 — 카드 전체가 잘리지 않게 다시 찍어주세요", None
+
+    patches = {
+        REFERENCE_NAMES[c]: [round(float(x), 1) for x in observed_rgb[r]] for r, c in zip(row_ind, col_ind)
+    }
+    return True, "카드 24개 패치 전부 인식 완료", patches
 
 
 # A candidate whose best achievable color-matching error is above this is
