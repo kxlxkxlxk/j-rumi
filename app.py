@@ -12,14 +12,87 @@ st.set_page_config(page_title="파운데이션 색상 추천", page_icon="💄")
 
 LOCAL_DB_PATH = "data/foundation_db.json"
 
-# Front-camera live preview only (mirror it so aiming the shot feels like a
-# normal mirror, the way phone selfie cameras do). This is a pure CSS flip
-# of what's on screen -- the actual photo bytes st.camera_input hands back
-# to the code below are untouched, so card/face detection keeps working on
-# the real (unmirrored) capture exactly as before.
+# ---------------------------------------------------------------------------
+# 화면 디자인 (핑크 톤). 실제 인식/보정/추천 로직에는 전혀 손대지 않고,
+# 화면에 보이는 부분(색상, 카메라를 켜는 시점, 버튼 모양)만 바꿔요.
+# 전체 배경/버튼/포인트 색은 .streamlit/config.toml 의 테마 색상을 따르고,
+# 여기서는 그 테마로는 부족한 세부 꾸밈(카드 모양, 그라데이션 헤더 등)만
+# 추가로 얹어요.
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
+    /* 전체적으로 조금 더 둥글고 부드러운 느낌 */
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 999px;
+        border: none;
+        padding: 0.6em 1.4em;
+        font-weight: 600;
+        box-shadow: 0 2px 8px rgba(255, 143, 171, 0.35);
+        transition: transform 0.15s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+    }
+
+    /* 상단 타이틀 영역을 부드러운 핑크 그라데이션 배너로 */
+    .hero-banner {
+        background: linear-gradient(135deg, #FFE3ED 0%, #FFF3F7 100%);
+        border-radius: 20px;
+        padding: 1.6em 1.8em;
+        margin-bottom: 1.4em;
+        border: 1px solid #FFD6E4;
+    }
+    .hero-banner h1 {
+        margin: 0 0 0.3em 0;
+        color: #4A3238;
+    }
+    .hero-banner p {
+        margin: 0;
+        color: #7A5C64;
+    }
+
+    /* 카메라를 켜기 전 안내 카드 */
+    .camera-placeholder {
+        background: #FFF3F7;
+        border: 1.5px dashed #FFB6C9;
+        border-radius: 18px;
+        padding: 2.4em 1.5em;
+        text-align: center;
+        color: #7A5C64;
+    }
+    .camera-placeholder .big-emoji {
+        font-size: 2.6em;
+        margin-bottom: 0.2em;
+    }
+
+    /* 파일 업로드 탭 안내 카드 */
+    .upload-hint {
+        background: #FFF3F7;
+        border-radius: 14px;
+        padding: 0.9em 1.2em;
+        color: #7A5C64;
+        margin-bottom: 0.8em;
+        font-size: 0.95em;
+    }
+
+    /* 탭 밑줄/선택색을 핑크 계열로 */
+    .stTabs [aria-selected="true"] {
+        color: #FF6B94 !important;
+    }
+    .stTabs [data-baseweb="tab-highlight"] {
+        background-color: #FF8FAB !important;
+    }
+
+    /* 결과 카드(추천 색상 위 배경) 둥글게 */
+    div[data-testid="stExpander"] {
+        border-radius: 14px;
+        border: 1px solid #FFD6E4 !important;
+    }
+
+    /* 전면 카메라 미리보기 좌우 반전 -- 셀카 찍듯 자연스럽게 보이도록 하는
+    순수 화면상 CSS 효과일 뿐, st.camera_input이 실제로 넘겨주는 사진
+    바이트 자체는 그대로라 카드/얼굴 인식은 원래 촬영본 그대로 처리돼요. */
     [data-testid="stCameraInput"] video,
     [data-testid="stCameraInputWebcamStyledBox"] video {
         transform: scaleX(-1);
@@ -85,10 +158,15 @@ def draw_region_overlay(rgb_img: np.ndarray, regions_debug: list) -> np.ndarray:
     return overlay
 
 
-st.title("💄 나에게 맞는 파운데이션 찾기")
-st.write(
-    "색상 카드와 얼굴을 같이 두고 촬영한 사진을 올려주세요. "
-    "카메라/조명에 따른 색 왜곡을 자동으로 보정해서 가장 비슷한 파운데이션을 추천해드려요."
+st.markdown(
+    """
+    <div class="hero-banner">
+        <h1>💄 나에게 맞는 파운데이션 찾기</h1>
+        <p>색상 카드와 얼굴을 같이 두고 촬영한 사진을 올려주세요.
+        카메라/조명에 따른 색 왜곡을 자동으로 보정해서 가장 비슷한 파운데이션을 추천해드려요.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 shades, source = load_shades()
@@ -96,16 +174,49 @@ if not shades:
     st.error("파운데이션 데이터베이스가 비어 있어요. 관리자 페이지에서 색상을 추가해주세요.")
     st.stop()
 
-tab1, tab2 = st.tabs(["📷 카메라로 촬영", "🖼️ 사진 업로드"])
+if "camera_active" not in st.session_state:
+    st.session_state.camera_active = False
+
+tab1, tab2 = st.tabs(["📷 카메라로 촬영", "🖼️ 사진첩에서 선택"])
 image_bgr = None
 
 with tab1:
-    cam_img = st.camera_input("색상 카드 + 얼굴이 같이 나오게 촬영해주세요")
-    if cam_img is not None:
-        image_bgr = pil_to_bgr(Image.open(cam_img))
+    if not st.session_state.camera_active:
+        # 페이지에 들어오자마자 카메라가 자동으로 켜지지 않도록, 버튼을
+        # 눌러야만 실제 카메라 위젯(st.camera_input)이 나타나게 해요.
+        st.markdown(
+            """
+            <div class="camera-placeholder">
+                <div class="big-emoji">🤳</div>
+                아래 버튼을 누르면 카메라가 켜져요.<br>
+                색상 카드와 얼굴이 함께 나오도록 준비한 뒤 눌러주세요.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.write("")
+        if st.button("📷 카메라 켜고 촬영하기", use_container_width=True, type="primary"):
+            st.session_state.camera_active = True
+            st.rerun()
+    else:
+        cam_img = st.camera_input("색상 카드 + 얼굴이 같이 나오게 촬영해주세요")
+        if st.button("✕ 카메라 끄기", use_container_width=True):
+            st.session_state.camera_active = False
+            st.rerun()
+        if cam_img is not None:
+            image_bgr = pil_to_bgr(Image.open(cam_img))
 
 with tab2:
-    uploaded = st.file_uploader("이미지 파일 선택", type=["jpg", "jpeg", "png"])
+    st.markdown(
+        """
+        <div class="upload-hint">
+            📁 아래 버튼을 누르면 휴대폰의 사진첩(갤러리) 또는 파일 앱에서
+            바로 사진을 골라올 수 있어요.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    uploaded = st.file_uploader("사진첩에서 선택", type=["jpg", "jpeg", "png"])
     if uploaded is not None:
         image_bgr = pil_to_bgr(Image.open(uploaded))
 
