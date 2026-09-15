@@ -97,7 +97,8 @@ def _select_medoid(region_labs, agreement_threshold: float = 8.0, region_names=N
 
 
 def recommend_foundation(
-    bgr_img: np.ndarray, shades: list, top_n: int = 3, card_bgr: np.ndarray = None
+    bgr_img: np.ndarray, shades: list, top_n: int = 3, card_bgr: np.ndarray = None,
+    has_card: bool = True,
 ) -> RecommendationResult:
     """bgr_img: the full photo (card + face), used for face/skin detection.
     card_bgr: optional -- a crop containing ONLY the color card, used for
@@ -106,10 +107,21 @@ def recommend_foundation(
     region is user-cropped in the UI; pass that crop here. Falls back to
     bgr_img itself (old automatic-detection-on-the-whole-photo behavior)
     when not given.
+
+    has_card: False is the path for someone who doesn't own a physical
+    ColorChecker card. There's no known-color reference in the photo to
+    measure the camera/lighting's color bias against, so card detection
+    and correction are skipped entirely -- the raw sampled cheek color is
+    used as the "corrected" color as-is. This is deliberately less
+    accurate (no camera/lighting bias removal at all), but lets someone
+    without the card still get a recommendation rather than being turned
+    away.
     """
-    calib = calibrate_from_image(card_bgr if card_bgr is not None else bgr_img)
-    if not calib.success:
-        return RecommendationResult(False, f"색상카드 인식 실패: {calib.message}")
+    calib = None
+    if has_card:
+        calib = calibrate_from_image(card_bgr if card_bgr is not None else bgr_img)
+        if not calib.success:
+            return RecommendationResult(False, f"색상카드 인식 실패: {calib.message}")
 
     skin = extract_skin_regions(bgr_img)
     if not skin.success:
@@ -118,7 +130,10 @@ def recommend_foundation(
     region_labs = []
     region_debug = []
     for region in skin.regions:
-        corrected_rgb = np.clip(calib.correction_matrix @ np.append(region.raw_rgb, 1.0), 0, 255)
+        if has_card:
+            corrected_rgb = np.clip(calib.correction_matrix @ np.append(region.raw_rgb, 1.0), 0, 255)
+        else:
+            corrected_rgb = np.array(region.raw_rgb, dtype=np.float64)
         lab = rgb_to_lab(corrected_rgb)
         region_labs.append(lab)
         region_debug.append(
@@ -149,8 +164,9 @@ def recommend_foundation(
         debug={
             "regions": region_debug,
             "final_region": skin.regions[medoid_idx].name,
-            "calibration_mean_error": calib.mean_delta_e,
-            "correction_matrix": calib.correction_matrix.tolist(),
+            "has_card": has_card,
+            "calibration_mean_error": calib.mean_delta_e if calib is not None else None,
+            "correction_matrix": calib.correction_matrix.tolist() if calib is not None else None,
             "brighter_pool_used": match_meta["brighter_pool_used"],
             "n_candidates_considered": match_meta["n_candidates"],
         },
