@@ -71,7 +71,7 @@ def _agreement_clusters(dist: np.ndarray, threshold: float):
     return list(groups.values())
 
 
-def _select_medoid(region_labs, agreement_threshold: float = 8.0):
+def _select_medoid(region_labs, agreement_threshold: float = 8.0, region_names=None):
     """1) Compute pairwise CIEDE2000 distance between every ROI's Lab.
     2) Group ROIs into clusters of mutual agreement (perceptually close
        to each other, within agreement_threshold) via union-find.
@@ -90,12 +90,37 @@ def _select_medoid(region_labs, agreement_threshold: float = 8.0):
     that also loosely agree with each other: summing distance to ALL
     other regions lets one shadowed region "win" by a hair even though
     the other side is the tighter, more mutually-consistent group.
+
+    Anatomical cheek priority (step 0, before clustering): chin and
+    under_mouth sit right next to the same shadow-casting features (the
+    lower lip, the jawline) and get darkened by the SAME light source at
+    the SAME time. That makes them look artificially "tight"/mutually
+    consistent to a pure statistics-based tightness tiebreak -- tighter
+    than two independently-lit cheeks -- even though the cheeks are the
+    standard, more reliable skin-sampling site. So: if both cheek_a and
+    cheek_b were sampled and they agree with each other (within
+    agreement_threshold), trust them immediately and short-circuit
+    before the general largest-cluster/tightness comparison ever runs.
+    Only when the cheeks themselves disagree (occlusion, stray highlight
+    on one side, etc. -- meaning we can't trust them) does this fall
+    through to the general logic below.
+
     Returns (final_lab, medoid_index, kept_indices, dist_matrix)."""
     n = len(region_labs)
     if n == 1:
         return region_labs[0], 0, [0], np.zeros((1, 1))
 
     dist = _pairwise_delta_e(region_labs)
+
+    if region_names is not None and "cheek_a" in region_names and "cheek_b" in region_names:
+        ia = region_names.index("cheek_a")
+        ib = region_names.index("cheek_b")
+        if dist[ia, ib] <= agreement_threshold:
+            kept = [ia, ib]
+            sub_dist = dist[np.ix_(kept, kept)]
+            sub_totals = sub_dist.sum(axis=1)
+            medoid_idx = kept[int(np.argmin(sub_totals))]
+            return region_labs[medoid_idx], medoid_idx, kept, dist
 
     clusters = _agreement_clusters(dist, agreement_threshold)
     max_size = max(len(c) for c in clusters)
@@ -156,7 +181,9 @@ def recommend_foundation(
             }
         )
 
-    final_lab, medoid_idx, kept_idx, _dist = _select_medoid(region_labs)
+    final_lab, medoid_idx, kept_idx, _dist = _select_medoid(
+        region_labs, region_names=[r.name for r in skin.regions]
+    )
     for i, rd in enumerate(region_debug):
         rd["used_as_final"] = i == medoid_idx
         rd["excluded_as_outlier"] = i not in kept_idx
