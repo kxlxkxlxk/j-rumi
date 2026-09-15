@@ -308,7 +308,10 @@ def find_card_quad(bgr_img: np.ndarray):
     return candidates[0] if candidates else None
 
 
-def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
+def _warp_card_with_transform(bgr_img: np.ndarray, quad: np.ndarray):
+    """Same as warp_card, but also returns the perspective matrix and
+    canonical output size -- needed by _refine_quad_from_patches below to
+    map a correction back the other way (canonical -> original image)."""
     side_w = max(
         np.linalg.norm(quad[1] - quad[0]), np.linalg.norm(quad[2] - quad[3])
     )
@@ -324,7 +327,149 @@ def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
     )
     M = cv2.getPerspectiveTransform(quad, dst)
     warped = cv2.warpPerspective(bgr_img, M, (out_w, out_h))
+    return warped, M, out_w, out_h
+
+
+def warp_card(bgr_img: np.ndarray, quad: np.ndarray):
+    warped, _M, _out_w, _out_h = _warp_card_with_transform(bgr_img, quad)
     return warped
+
+
+def _refine_quad_from_patches(quad, boxes, M, out_w, out_h, orig_shape, border_units: float = -0.05):
+    """The initial candidate quad (from _candidate_quads) is only a rough
+    guess -- e.g. the hue-grid strategy pads a tight cluster of detected
+    color patches outward by an assumed, fixed proportion to estimate
+    where the card's actual edge is, which can overshoot (even past the
+    photo's own edge on some tilts/angles) or undershoot depending on how
+    the card sits in the frame, and can leave the card still sitting at a
+    slight angle in the warped preview instead of flat.
+
+    Picking any single corner (or 4 corners) of the grid to anchor a
+    refit is fragile: the corner cells are exactly the ones most likely
+    to be inferred/extrapolated rather than directly detected (dark
+    patches like black_20 aren't picked up by the bright-patch contour
+    step at all), so their individual position error is the highest of
+    any cell in the grid -- basing the whole refit on just those 4 points
+    means inheriting their worst-case error. Using all 24 detected patch
+    centers is far more robust: we know their IDEAL positions exactly (a
+    perfect 6x4 grid of unit cells, since that's the ColorChecker
+    Classic's fixed physical layout) and can fit a single homography
+    mapping that ideal grid to where the centers actually landed in this
+    warp -- a 24-point least-squares fit averages out any one cell's
+    noise instead of being dictated by it.
+
+    `border_units` (in the same unit-cell scale) is deliberately small
+    and slightly NEGATIVE by default: trying to extrapolate all the way
+    out to the card's true physical edge (past the patches, out to its
+    printed black border) turned out to be unreliable in practice -- any
+    real camera has a little lens distortion a single homography can't
+    model, and that error only grows when extrapolated beyond the fitted
+    points, which is exactly what produced the persistent sliver of
+    background this replaces. Landing slightly INSIDE the outermost
+    patches instead is a much safer bet: it can never expose background,
+    since it never leaves the region we actually, directly observed to
+    be patch color, at the cost of not showing the card's own printed
+    border in the preview -- a fine trade since only the 24 patch colors
+    need to stay legible, not the card's physical frame. Mapping those 4
+    points back through the INVERSE of this warp into the original
+    image, then re-warping with them, "pulls"/stretches the patches to
+    fill the whole canonical frame in one shot.
+    """
+    n = len(boxes)
+    n_cols, n_rows = (6, 4) if out_w >= out_h else (4, 6)
+
+    if n != n_cols * n_rows:
+        # Not the expected clean grid -- fall back to a plain padded
+        # bounding box (still an improvement over the original rough quad).
+        xs0 = [x for (x, y, bw, bh) in boxes]
+        ys0 = [y for (x, y, bw, bh) in boxes]
+        xs1 = [x + bw for (x, y, bw, bh) in boxes]
+        ys1 = [y + bh for (x, y, bw, bh) in boxes]
+        median_w = float(np.median([bw for (_, _, bw, _bh) in boxes]))
+        median_h = float(np.median([bh for (_, _, _bw, bh) in boxes]))
+        margin_x, margin_y = median_w * 0.25, median_h * 0.25
+        x0 = max(0.0, min(xs0) - margin_x)
+        y0 = max(0.0, min(ys0) - margin_y)
+        x1 = min(float(out_w), max(xs1) + margin_x)
+        y1 = min(float(out_h), max(ys1) + margin_y)
+        canonical_corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+    else:
+        # boxes is in deterministic row-major grid order (see
+        # detect_patches: `for cy in row_ys: for cx in col_xs: ...`).
+        centers = np.array(
+            [[x + bw / 2.0, y + bh / 2.0] for (x, y, bw, bh) in boxes], dtype=np.float64
+        )
+        ideal = np.array(
+            [[c + 0.5, r + 0.5] for r in range(n_rows) for c in range(n_cols)],
+            dtype=np.float64,
+        )
+
+        H, _mask = cv2.findHomography(ideal, centers, method=0)
+
+        ideal_card_corners = np.array(
+            [
+                [-border_units, -border_units],
+                [n_cols + border_units, -border_units],
+                [n_cols + border_units, n_rows + border_units],
+                [-border_units, n_rows + border_units],
+            ],
+            dtype=np.float64,
+        )
+        ones = np.ones((4, 1), dtype=np.float64)
+        homog = np.hstack([ideal_card_corners, ones])
+        canonical_mapped = (H @ homog.T).T
+        canonical_corners = canonical_mapped[:, :2] / canonical_mapped[:, 2:3]
+
+    canonical_corners[:, 0] = np.clip(canonical_corners[:, 0], 0, out_w)
+    canonical_corners[:, 1] = np.clip(canonical_corners[:, 1], 0, out_h)
+
+    M_inv = np.linalg.inv(M)
+    ones = np.ones((4, 1), dtype=np.float64)
+    homog = np.hstack([canonical_corners, ones])
+    mapped = (M_inv @ homog.T).T
+    mapped = mapped[:, :2] / mapped[:, 2:3]
+
+    h_img, w_img = orig_shape[:2]
+    mapped[:, 0] = np.clip(mapped[:, 0], 0, w_img - 1)
+    mapped[:, 1] = np.clip(mapped[:, 1], 0, h_img - 1)
+
+    return mapped.astype(np.float32)
+
+
+def _warp_and_detect_refined(bgr_img: np.ndarray, quad: np.ndarray, n_refine_passes: int = 2):
+    """Rough warp + patch-detect pass, then up to `n_refine_passes` rounds
+    of _refine_quad_from_patches (see there for why one pass is needed at
+    all). A tilted card can need more than one round to fully converge --
+    each pass re-derives the quad from where the patches actually landed
+    in the PREVIOUS pass's warp, so residual skew shrinks with each round
+    instead of needing to be fully corrected in one shot. Stops early once
+    a pass stops finding more patches (no more room to improve) or the
+    quad barely moves. Always keeps the best (most-patches-found) result
+    seen, so a bad later pass can never make things worse than an earlier
+    good one. Returns (quad_used, warped_used, boxes_used)."""
+    warped, M, out_w, out_h = _warp_card_with_transform(bgr_img, quad)
+    boxes = detect_patches(warped)
+    if len(boxes) < 20:
+        return quad, warped, boxes
+
+    best_quad, best_warped, best_boxes = quad, warped, boxes
+
+    for _ in range(n_refine_passes):
+        refined_quad = _refine_quad_from_patches(
+            best_quad, best_boxes, M, out_w, out_h, bgr_img.shape
+        )
+        if np.allclose(refined_quad, best_quad, atol=1.0):
+            break  # converged -- another pass wouldn't change anything
+        refined_warped, M, out_w, out_h = _warp_card_with_transform(bgr_img, refined_quad)
+        refined_boxes = detect_patches(refined_warped)
+        if len(refined_boxes) < 20:
+            break
+        if len(refined_boxes) >= len(best_boxes):
+            best_quad, best_warped, best_boxes = refined_quad, refined_warped, refined_boxes
+        else:
+            break
+
+    return best_quad, best_warped, best_boxes
 
 
 def _find_bright_patch_boxes(warped_bgr: np.ndarray):
@@ -479,8 +624,7 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
     if this particular candidate didn't pan out -- that's expected for
     most candidates; calibrate_from_image tries several and keeps the
     best)."""
-    warped = warp_card(bgr_img, quad)
-    boxes = detect_patches(warped)
+    quad, warped, boxes = _warp_and_detect_refined(bgr_img, quad)
     if len(boxes) < 20:
         return CalibrationResult(False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)")
 
@@ -550,8 +694,7 @@ def capture_card_reference(bgr_img: np.ndarray):
 
     best = None
     for quad in candidates:
-        warped = warp_card(bgr_img, quad)
-        boxes = detect_patches(warped)
+        quad, warped, boxes = _warp_and_detect_refined(bgr_img, quad)
         if len(boxes) < 20:
             continue
         observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])

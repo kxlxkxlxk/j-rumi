@@ -1,28 +1,28 @@
 """
 Face landmark based skin-tone sampling.
 
-Multi-region ROI method (aligned with the original team's documented
-pipeline: 하부 볼 / 입 아래 / 턱 ROI 구성 -> ROI별 대표색 추출 -> 이상치 제외 ->
-CIEDE2000 medoid로 최종 피부색 선정):
+Multi-region ROI method: samples both lower cheeks, which tend to avoid
+eyebrows/eyelashes/hair and the shadow that often falls under the eyes,
+nose, and chin. Within each region, the brightest and darkest pixels
+(specular highlight / shadow) are dropped before taking the median
+color, matching the report's "클리핑·그림자 픽셀 제거" step.
 
-Instead of one sample point, this samples several skin regions --both
-lower cheeks, just under the mouth, and the chin-- that tend to avoid
-eyebrows/eyelashes/hair and the shadow that often falls under the eyes.
-Within each region, the brightest and darkest pixels (specular highlight
-/ shadow) are dropped before taking the median color, matching the
-report's "클리핑·그림자 픽셀 제거" step.
+(Earlier drafts also sampled under_mouth and chin, matching the original
+team's 하부 볼 / 입 아래 / 턱 documented pipeline. Those two were removed
+per product decision: they sit low on the face, right next to the same
+shadow-casting features -- the lower lip, the jawline -- so they tend to
+read darker than the cheeks and don't add anything the cheeks don't
+already cover better.)
 
 This module only returns the raw (uncorrected) color per region. The
-camera-color correction (from calibration.py) and the final CIEDE2000
-medoid selection across regions happen in recommend.py, since that is
-where the corrected Lab values are available.
+camera-color correction (from calibration.py) and the final
+brightest-region selection across regions happen in recommend.py, since
+that is where the corrected Lab values are available.
 
 Landmark indices (mediapipe FaceLandmarker's 478-point face mesh -- same
 topology/index numbering as the older FaceMesh(refine_landmarks=True)):
   50, 280   - a point on each cheek, below the eye and above the mouth
               corner (commonly used "cheek" landmarks in AR/makeup apps)
-  175       - just below the lower lip, above the chin (under-mouth)
-  152       - chin tip
   468, 473  - left/right iris centers -- used only to scale the ROI
               radius to the person's actual face size via interpupillary
               distance.
@@ -55,8 +55,6 @@ RIGHT_IRIS_CENTER_IDX = 473
 REGION_LANDMARKS = {
     "cheek_a": 50,   # cheek, camera-frame side A
     "cheek_b": 280,  # cheek, camera-frame side B
-    "under_mouth": 175,
-    "chin": 152,
 }
 
 # repo_root/models/face_landmarker.task (this file lives in repo_root/src/)

@@ -3,13 +3,11 @@ End-to-end pipeline: a single photo containing BOTH the ColorChecker card
 and the subject's face -> camera/lighting-corrected skin Lab value ->
 best-matching foundation shade(s) from the DB.
 
-Skin color step (matches the report's documented approach): sample several
-ROIs on the face (both lower cheeks, under the mouth, chin) rather than a
-single point, correct each with the card-based calibration, convert to
-Lab, then pick the most representative one via a CIEDE2000 "medoid" --
-the ROI closest (in perceptual color distance) to all the others -- after
-dropping any ROI that looks like an outlier (blush, stray shadow, a
-slightly clipped highlight).
+Skin color step: sample both lower cheeks rather than a single point,
+correct each with the card-based calibration, convert to Lab, then take
+whichever reads lightest (highest L) as the final skin tone -- shadow
+only ever darkens a reading relative to its true color, so the lightest
+of the sampled regions is, by construction, the least shadow-affected.
 """
 from dataclasses import dataclass, field
 import numpy as np
