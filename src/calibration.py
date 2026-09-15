@@ -618,6 +618,23 @@ def apply_correction_image(rgb_img: np.ndarray, M: np.ndarray) -> np.ndarray:
     return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
+# How much of the full card-based correction to actually apply, from 0.0
+# (no correction at all) to 1.0 (the full, mathematically "correct"
+# camera/lighting correction). The reference app ("제루미") the product
+# owner is matching against visibly applies a much milder correction than
+# the full physically-derived one -- e.g. for one test photo, the full
+# correction moves the skin color by ΔE00≈10.3, while the reference app's
+# own before/after only moves it by ΔE00≈2.5. Blending the fitted matrix
+# toward the identity transform at strength≈0.3 reproduces that same,
+# gentler magnitude (~ΔE00 3.0 on the same test case) while still pointing
+# in the same (camera-bias-correcting) direction. This is a deliberate,
+# tunable product choice, not a bug fix -- turning it up trades a more
+# "technically correct" (but visually stronger) correction for matching
+# the reference app's subtler look; turning it down or up is just editing
+# this one constant.
+CORRECTION_STRENGTH = 0.3
+
+
 def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
     """Run the warp -> patch-detect -> color-match -> solve pipeline for
     ONE candidate quad. Returns a CalibrationResult (success may be False
@@ -648,15 +665,26 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
 
     M = solve_correction_matrix(fit_observed, fit_reference)
 
+    # mean_err (and thus which candidate quad "wins" in calibrate_from_image)
+    # is deliberately measured against the FULL-strength matrix, not the
+    # blended one below -- it's a measure of how well the card itself was
+    # detected/read, which shouldn't change just because we've since decided
+    # to apply a gentler correction to the final photo.
     corrected = np.array([apply_correction(o, M) for o in matched_observed])
     mean_err = float(np.mean(np.linalg.norm(corrected - matched_reference, axis=1)))
+
+    # Blend the fitted correction toward "do nothing" (identity) so the
+    # correction actually applied to the photo is milder than the full,
+    # physically-derived one -- see CORRECTION_STRENGTH above.
+    M_identity = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+    M_applied = CORRECTION_STRENGTH * M + (1 - CORRECTION_STRENGTH) * M_identity
 
     centers = np.array([[x + bw / 2, y + bh / 2] for (x, y, bw, bh) in boxes])
 
     return CalibrationResult(
         True,
         f"카드 {len(boxes)}개 패치 인식 완료, 평균 보정 오차 {mean_err:.1f}",
-        correction_matrix=M,
+        correction_matrix=M_applied,
         mean_delta_e=mean_err,
         card_corners=quad,
         patch_centers_canonical=centers[row_ind],
